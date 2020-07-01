@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -6,14 +6,16 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using dnlib.DotNet;
 using dnlib.DotNet.Emit;
+using dnlib.DotNet.Writer;
 
 namespace ILProtectorUnpacker {
     public class Unpacker {
-        private static ModuleDefMD _module;
-        private static Assembly _assembly;
         private static readonly List<object> ToRemove = new List<object>();
 
         private static void Main(string[] args) {
+            Console.WriteLine("ILProtectorUnpacker 1.1" + Environment.NewLine);
+
+
             if (args.Length == 0) {
                 Console.WriteLine("Please drag & drop the protected file");
                 Console.WriteLine("Press any key to exit....");
@@ -21,14 +23,20 @@ namespace ILProtectorUnpacker {
                 return;
             }
 
-			var asmResolver = new AssemblyResolver {
-				EnableFrameworkRedirect = false
-			};
-			asmResolver.DefaultModuleContext = new ModuleContext(asmResolver);
+            var asmResolver = new AssemblyResolver {
+                EnableFrameworkRedirect = false
+            };
+            asmResolver.DefaultModuleContext = new ModuleContext(asmResolver);
 
-            _module = ModuleDefMD.Load(args[0], asmResolver.DefaultModuleContext);
-            _assembly = Assembly.LoadFrom(args[0]);
+            Console.WriteLine("Loading Module...");
+
+            var _module = ModuleDefMD.Load(args[0], asmResolver.DefaultModuleContext);
+            var _assembly = Assembly.LoadFrom(args[0]);
+
+            Console.WriteLine("Running global constructor...");
             RuntimeHelpers.RunModuleConstructor(_assembly.ManifestModule.ModuleHandle);
+
+            Console.WriteLine("Resolving fields...");
 
             var invokeField = _module.GlobalType.FindField("Invoke");
             var stringField = _module.GlobalType.FindField("String");
@@ -41,105 +49,130 @@ namespace ILProtectorUnpacker {
 
             var invokeInstance = _assembly.ManifestModule.ResolveField(invokeField.MDToken.ToInt32());
             var invokeMethod = _assembly.ManifestModule.ResolveMethod(invokeMethodToken.Value);
+            var invokeFieldInst = invokeInstance.GetValue(invokeInstance);
 
-            FieldInfo strInstance = null;
             MethodBase strInvokeMethod = null;
+            object strFieldInst = null;
             if (strInvokeMethodToken != null) {
-                strInstance = _assembly.ManifestModule.ResolveField(stringField.MDToken.ToInt32());
+                var strInstance = _assembly.ManifestModule.ResolveField(stringField.MDToken.ToInt32());
                 strInvokeMethod = _assembly.ManifestModule.ResolveMethod(strInvokeMethodToken.Value);
+                strFieldInst = strInstance.GetValue(strInstance);
                 ToRemove.Add(stringField);
             }
 
             ToRemove.Add(invokeField);
-            Hooks.ApplyHook();
-            foreach (var type in _module.GetTypes()) {
-				foreach (var method in type.Methods) {
-                    DecryptMethods(method, invokeMethod, invokeInstance.GetValue(invokeInstance));
-                    if (strInstance != null)
-                        DecryptStrings(method, strInvokeMethod, strInstance.GetValue(strInstance));
-                }
-			}
 
-			foreach (var obj in ToRemove) {
-				switch (obj) {
+            Console.WriteLine("Applying hook...");
+            Hooks.ApplyHook();
+
+            Console.WriteLine("Processing methods...");
+            foreach (var type in _module.GetTypes()) {
+                foreach (var method in type.Methods) {
+                    if (!method.HasBody)
+                        continue;
+
+                    Hooks.SpoofedMethod = _assembly.ManifestModule.ResolveMethod(method.MDToken.ToInt32());
+
+                    DecryptMethods(method, invokeMethod, invokeFieldInst);
+
+                    if (strFieldInst != null)
+                        DecryptStrings(method, strInvokeMethod, strFieldInst);
+                }
+            }
+
+            Console.WriteLine("Cleaning junk...");
+            foreach (var obj in ToRemove) {
+                switch (obj) {
                     case FieldDef fieldDefinition:
                         var res = fieldDefinition.FieldType.ToTypeDefOrRefSig().TypeDef;
-						if (res.DeclaringType != null)
-							res.DeclaringType.NestedTypes.Remove(res);
-						else
-							_module.Types.Remove(res);
-						fieldDefinition.DeclaringType.Fields.Remove(fieldDefinition);
+                        if (res.DeclaringType != null)
+                            res.DeclaringType.NestedTypes.Remove(res);
+                        else
+                            _module.Types.Remove(res);
+                        fieldDefinition.DeclaringType.Fields.Remove(fieldDefinition);
                         break;
                     case TypeDef typeDefinition:
                         typeDefinition.DeclaringType.NestedTypes.Remove(typeDefinition);
                         break;
                 }
-			}
+            }
 
-			foreach (var method in _module.GlobalType.Methods
-                .Where(t => t.HasImplMap && t.ImplMap.Module.Name.Contains("Protect")).ToList())
+            foreach (var method in _module.GlobalType.Methods
+                                          .Where(t => t.HasImplMap && t.ImplMap.Module.Name.Contains("Protect"))) {
                 _module.GlobalType.Methods.Remove(method);
+            }
 
-			var constructor = _module.GlobalType.FindStaticConstructor();
+            var constructor = _module.GlobalType.FindStaticConstructor();
 
             if (constructor.Body != null) {
                 var methodBody = constructor.Body;
-                var startIndex = methodBody.Instructions.IndexOf(
+                int startIndex = methodBody.Instructions.IndexOf(
                     methodBody.Instructions.FirstOrDefault(t =>
                         t.OpCode == OpCodes.Call && ((IMethodDefOrRef)t.Operand).Name ==
                         "GetIUnknownForObject")) - 2;
 
-                var endIndex = methodBody.Instructions.IndexOf(methodBody.Instructions.FirstOrDefault(
+                int endIndex = methodBody.Instructions.IndexOf(methodBody.Instructions.FirstOrDefault(
                     inst => inst.OpCode == OpCodes.Call &&
                             ((IMethodDefOrRef)inst.Operand).Name == "Release")) + 2;
 
                 methodBody.ExceptionHandlers.Remove(methodBody.ExceptionHandlers.FirstOrDefault(
                     exh => exh.HandlerEnd.Offset == methodBody.Instructions[endIndex + 1].Offset));
 
-                for (var i = startIndex; i <= endIndex; i++)
+                for (int i = startIndex; i <= endIndex; i++)
                     methodBody.Instructions.Remove(methodBody.Instructions[startIndex]);
             }
 
-            var extension = Path.GetExtension(args[0]);
-            var path = args[0].Remove(args[0].Length - extension.Length, extension.Length) + "-unpacked" + extension;
-            _module.Write(path);
+            Console.WriteLine("Writing module...");
+
+            string newFilePath =
+                $"{Path.GetDirectoryName(args[0])}{Path.DirectorySeparatorChar}{Path.GetFileNameWithoutExtension(args[0])}-Unpacked{Path.GetExtension(args[0])}";
+
+            ModuleWriterOptionsBase modOpts;
+
+            if (!_module.IsILOnly || _module.VTableFixups != null)
+                modOpts = new NativeModuleWriterOptions(_module, true);
+            else
+                modOpts = new ModuleWriterOptions(_module);
+
+			if (modOpts is NativeModuleWriterOptions nativeOptions)
+                _module.NativeWrite(newFilePath, nativeOptions);
+            else
+                _module.Write(newFilePath, (ModuleWriterOptions)modOpts);
+
+            Console.WriteLine("Done!");
+            Console.ReadKey(true);
         }
 
-        private static void DecryptMethods(MethodDef methodDefinition, MethodBase invokeMethod,
-            object fieldInstance) {
-            if (methodDefinition.Body == null)
-                return;
-            var instructions = methodDefinition.Body.Instructions;
+        private static void DecryptMethods(MethodDef methodDef, MethodBase invokeMethod, object fieldInstance) {
+            var instructions = methodDef.Body.Instructions;
             if (instructions.Count < 9)
                 return;
             if (instructions[0].OpCode != OpCodes.Ldsfld)
                 return;
             if (((FieldDef)instructions[0].Operand).FullName != "i <Module>::Invoke")
                 return;
+
             ToRemove.Add(instructions[3].Operand);
-            Hooks.MethodBase = _assembly.ManifestModule.ResolveMethod(methodDefinition.MDToken.ToInt32());
-            var index = instructions[1].GetLdcI4Value();
 
-			var dynamicMethodBodyReader = new DynamicMethodBodyReader(_module, invokeMethod.Invoke(fieldInstance, new object[] { index }));
-			dynamicMethodBodyReader.Read();
+            int index = instructions[1].GetLdcI4Value();
 
-			methodDefinition.FreeMethodBody();
-            methodDefinition.Body = dynamicMethodBodyReader.GetMethod().Body;
+            var dynamicMethodBodyReader = new DynamicMethodBodyReader(methodDef.Module, invokeMethod.Invoke(fieldInstance, new object[] { index }));
+            dynamicMethodBodyReader.Read();
+
+            methodDef.FreeMethodBody();
+            methodDef.Body = dynamicMethodBodyReader.GetMethod().Body;
         }
 
-        private static void DecryptStrings(MethodDef methodDefinition, MethodBase invokeMethod,
-            object fieldInstance) {
-            if (methodDefinition.Body == null)
-                return;
+        private static void DecryptStrings(MethodDef methodDefinition, MethodBase invokeMethod, object fieldInstance) {
             var instructions = methodDefinition.Body.Instructions;
             if (instructions.Count < 3)
                 return;
-            for (var i = 2; i < instructions.Count; i++) {
+            for (int i = 2; i < instructions.Count; i++) {
                 if (instructions[i].OpCode != OpCodes.Callvirt)
                     continue;
                 if (instructions[i].Operand.ToString() != "System.String s::Invoke(System.Int32)")
                     continue;
-                var index = instructions[i - 1].GetLdcI4Value();
+                int index = instructions[i - 1].GetLdcI4Value();
                 instructions[i].OpCode = OpCodes.Ldstr;
                 instructions[i - 1].OpCode = OpCodes.Nop;
                 instructions[i - 2].OpCode = OpCodes.Nop;
