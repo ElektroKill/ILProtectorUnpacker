@@ -97,9 +97,9 @@ namespace ILProtectorUnpacker {
                 }
             }
 
-            foreach (var method in _module.GlobalType.Methods
-                                          .Where(t => t.HasImplMap && t.ImplMap.Module.Name.Contains("Protect"))) {
-                _module.GlobalType.Methods.Remove(method);
+			foreach (var method in _module.GlobalType.Methods
+										  .Where(t => t.HasImplMap && t.ImplMap.Name == "P0").ToList()) {
+                _module.GlobalType.Remove(method);
             }
 
             var constructor = _module.GlobalType.FindStaticConstructor();
@@ -134,7 +134,7 @@ namespace ILProtectorUnpacker {
             else
                 modOpts = new ModuleWriterOptions(_module);
 
-			if (modOpts is NativeModuleWriterOptions nativeOptions)
+            if (modOpts is NativeModuleWriterOptions nativeOptions)
                 _module.NativeWrite(newFilePath, nativeOptions);
             else
                 _module.Write(newFilePath, (ModuleWriterOptions)modOpts);
